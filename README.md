@@ -1,0 +1,2 @@
+# lotsy-bot
+Lotsy bot
