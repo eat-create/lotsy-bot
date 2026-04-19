@@ -1,0 +1,12 @@
+{
+  "name": "lotsy-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for Lotsy inventory management",
+  "main": "src/index.js",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  }
+}
