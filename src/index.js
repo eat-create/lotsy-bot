@@ -186,8 +186,9 @@ function parseCommand(text) {
   // Help
   if (/^(help|\/help|\/start|commands)$/i.test(t)) return { cmd: 'help' };
 
-  // Undo
-  if (/^(undo|\/undo|revert|nvm|nevermind)$/i.test(t)) return { cmd: 'undo' };
+  // Undo — optional argument picks which of last 5 actions to reverse
+  const undoMatch = t.match(/^(?:undo|\/undo|revert|nvm|nevermind)(?:\s+(\w+))?$/i);
+  if (undoMatch) return { cmd: 'undo', which: undoMatch[1] || null };
 
   // Today / week / total / stock
   if (/^(today|\/today|today.?s)$/i.test(t)) return { cmd: 'summary', range: 'today' };
@@ -263,7 +264,9 @@ const HELP_TEXT = `<b>Lotsy commands</b>
 • <code>total</code> — all time
 
 <b>Oops</b>
-• <code>undo</code> — reverses your last action
+• <code>undo</code> — shows last 5 actions, pick which to reverse
+• <code>undo 3</code> — reverses action #3 from the list
+• <code>undo last</code> — reverses the most recent action
 
 Default platform is FB Marketplace. Add <code>ebay</code>, <code>mercari</code>, or <code>offerup</code> to override.`;
 
@@ -277,7 +280,7 @@ async function handleSold(env, parsed, userName) {
 
     if (!parsed.price) return `How much did ${unit.skus.name} (${parsed.unitCode}) sell for? Reply <code>sold ${parsed.unitCode} 22</code>.`;
 
-    await insertSale(env, {
+    const saleResult = await insertSale(env, {
       unit_id: unit.id,
       platform: parsed.platform,
       sold_price: parsed.price,
@@ -285,6 +288,17 @@ async function handleSold(env, parsed, userName) {
       notes: `via Telegram (${userName})`,
     });
     await markUnitSold(env, unit.id);
+
+    // Remember for undo
+    await rememberLastAction(env, parsed._userId, {
+      type: 'sold',
+      payload: {
+        sale_ids: saleResult && saleResult[0] ? [saleResult[0].id] : [],
+        unit_ids: [unit.id],
+        sku_name: unit.skus.name,
+        qty: 1,
+      },
+    });
 
     const remaining = await loadUnitsForSku(env, unit.sku_id);
     return `✅ Sold <b>${unit.skus.name}</b> (${parsed.unitCode}) for $${parsed.price} via ${platformLabel(parsed.platform)}.\n<i>${remaining.length} in stock.</i>`;
@@ -322,8 +336,9 @@ async function handleSold(env, parsed, userName) {
   // Sell N units at $price each
   const unitsToSell = availableUnits.slice(0, qty);
   const soldCodes = [];
+  const saleIds = [];
   for (const unit of unitsToSell) {
-    await insertSale(env, {
+    const saleResult = await insertSale(env, {
       unit_id: unit.id,
       platform: parsed.platform,
       sold_price: parsed.price,
@@ -332,7 +347,19 @@ async function handleSold(env, parsed, userName) {
     });
     await markUnitSold(env, unit.id);
     soldCodes.push(unit.unit_code);
+    if (saleResult && saleResult[0]) saleIds.push(saleResult[0].id);
   }
+
+  // Remember for undo — last action wins (batch sales remembered as a group)
+  await rememberLastAction(env, parsed._userId, {
+    type: 'sold',
+    payload: {
+      sale_ids: saleIds,
+      unit_ids: unitsToSell.map(u => u.id),
+      sku_name: sku.name,
+      qty,
+    },
+  });
 
   const remaining = availableUnits.length - qty;
   if (qty === 1) {
@@ -400,6 +427,16 @@ async function handleDamage(env, parsed, userName) {
       supplier_notes: `Reported by ${userName}`,
     });
     await sb(env, 'PATCH', `units?id=eq.${unit.id}`, { status: 'damaged' });
+
+    await rememberLastAction(env, parsed._userId, {
+      type: 'damage',
+      payload: {
+        report_id: report && report[0] ? report[0].id : null,
+        unit_id: unit.id,
+        sku_name: unit.skus?.name,
+      },
+    });
+
     return `⚠️ Damage report opened for <b>${unit.skus?.name || parsed.unitCode}</b>.\n<i>Add photos + claim amount via the Lotsy app.</i>`;
   }
 
@@ -416,6 +453,15 @@ async function handleDamage(env, parsed, userName) {
     reported_at: new Date().toISOString(),
     supplier_notes: `${parsed.qty} units reported by ${userName}`,
   });
+
+  await rememberLastAction(env, parsed._userId, {
+    type: 'damage',
+    payload: {
+      report_id: report && report[0] ? report[0].id : null,
+      sku_name: match.best.name,
+    },
+  });
+
   return `⚠️ Damage report opened: <b>${parsed.qty}× ${match.best.name}</b>.\n<i>Add photos + claim amount via the Lotsy app.</i>`;
 }
 
@@ -474,28 +520,94 @@ async function rememberLastAction(env, userId, action) {
   }
 }
 
-async function undoLastAction(env, userId) {
-  try {
-    const rows = await sb(env, 'GET',
-      `telegram_actions?telegram_user_id=eq.${userId}&order=created_at.desc&limit=1`);
-    const last = rows[0];
-    if (!last) return `Nothing to undo.`;
-    if (last.undone) return `Your last action is already undone.`;
+// ============================================================================
+// UNDO — shows last 5 undoable actions, lets user pick which to reverse
+// ----------------------------------------------------------------------------
+// `undo`         → lists last 5 actions
+// `undo 3`       → reverses action #3 from the list
+// `undo last`    → reverses most recent (equivalent to `undo 1`)
+// ============================================================================
 
-    const p = last.payload;
-    if (last.action_type === 'sold' && p.sale_id && p.unit_id) {
-      await sb(env, 'DELETE', `sales?id=eq.${p.sale_id}`);
-      await sb(env, 'PATCH', `units?id=eq.${p.unit_id}`, { status: 'inventory' });
-      await sb(env, 'PATCH', `telegram_actions?id=eq.${last.id}`, { undone: true });
-      return `↩️ Undone: sale of ${p.sku_name || 'unit'} reversed.`;
+function formatActionSummary(action) {
+  const p = action.payload || {};
+  const when = new Date(action.created_at);
+  const timeAgo = humanTimeAgo(when);
+  if (action.action_type === 'sold') {
+    const qty = p.qty || (p.sale_ids ? p.sale_ids.length : 1);
+    return `Sold ${qty}× ${p.sku_name || 'unit'} · ${timeAgo}`;
+  }
+  if (action.action_type === 'damage') {
+    return `Damage report: ${p.sku_name || 'unit'} · ${timeAgo}`;
+  }
+  return `${action.action_type} · ${timeAgo}`;
+}
+
+function humanTimeAgo(date) {
+  const mins = Math.max(0, Math.round((Date.now() - date.getTime()) / 60000));
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.round(hrs / 24);
+  return `${days}d ago`;
+}
+
+async function reverseAction(env, action) {
+  const p = action.payload || {};
+  if (action.action_type === 'sold') {
+    const saleIds = p.sale_ids || (p.sale_id ? [p.sale_id] : []);
+    const unitIds = p.unit_ids || (p.unit_id ? [p.unit_id] : []);
+    if (saleIds.length === 0) return { error: 'no sale IDs recorded' };
+    for (const saleId of saleIds) {
+      await sb(env, 'DELETE', `sales?id=eq.${saleId}`);
     }
-    if (last.action_type === 'damage' && p.report_id) {
-      await sb(env, 'DELETE', `damage_reports?id=eq.${p.report_id}`);
-      if (p.unit_id) await sb(env, 'PATCH', `units?id=eq.${p.unit_id}`, { status: 'inventory' });
-      await sb(env, 'PATCH', `telegram_actions?id=eq.${last.id}`, { undone: true });
-      return `↩️ Undone: damage report reversed.`;
+    for (const unitId of unitIds) {
+      await sb(env, 'PATCH', `units?id=eq.${unitId}`, { status: 'inventory' });
     }
-    return `Couldn't undo — unknown action type.`;
+    await sb(env, 'PATCH', `telegram_actions?id=eq.${action.id}`, { undone: true });
+    return { ok: true, message: `${saleIds.length > 1 ? `${saleIds.length} sales` : 'sale'} of <b>${p.sku_name || 'unit'}</b>` };
+  }
+  if (action.action_type === 'damage' && p.report_id) {
+    await sb(env, 'DELETE', `damage_reports?id=eq.${p.report_id}`);
+    if (p.unit_id) await sb(env, 'PATCH', `units?id=eq.${p.unit_id}`, { status: 'inventory' });
+    await sb(env, 'PATCH', `telegram_actions?id=eq.${action.id}`, { undone: true });
+    return { ok: true, message: `damage report for <b>${p.sku_name || 'unit'}</b>` };
+  }
+  return { error: 'unknown action type' };
+}
+
+async function undoLastAction(env, userId, which) {
+  try {
+    // Pull last 5 actions that haven't been undone yet
+    const rows = await sb(env, 'GET',
+      `telegram_actions?telegram_user_id=eq.${userId}&undone=eq.false&order=created_at.desc&limit=5`);
+
+    if (rows.length === 0) return `Nothing to undo.`;
+
+    // `undo last` or `undo` with no number → always reverse #1 (most recent)
+    // But if there are multiple and user just typed `undo`, show the list first
+    const asNum = which != null ? parseInt(which, 10) : null;
+    const isLastShortcut = which === 'last' || which === '1';
+
+    // No argument → show the list for picking
+    if ((which === undefined || which === null || which === '') && rows.length > 1) {
+      const lines = rows.map((a, i) => `${i + 1}. ${formatActionSummary(a)}`).join('\n');
+      return `<b>Which action should I undo?</b>\n${lines}\n\nReply with <code>undo 1</code>, <code>undo 2</code>, etc.\nOr <code>undo last</code> for the most recent.`;
+    }
+
+    // Pick specific action by index
+    let target;
+    if (isLastShortcut || (which === undefined || which === null || which === '')) {
+      target = rows[0];
+    } else if (!isNaN(asNum) && asNum >= 1 && asNum <= rows.length) {
+      target = rows[asNum - 1];
+    } else {
+      return `I don't see that action. Reply <code>undo</code> to see the list.`;
+    }
+
+    const result = await reverseAction(env, target);
+    if (result.error) return `Couldn't undo — ${result.error}`;
+    return `↩️ Undone: ${result.message} reversed.`;
   } catch (e) {
     return `Undo unavailable — ${e.message.slice(0, 100)}`;
   }
@@ -599,6 +711,7 @@ export default {
     // Parse + route
     try {
       const parsed = parseCommand(text);
+      parsed._userId = userId;  // needed by handlers to record undoable actions
       let reply;
 
       switch (parsed.cmd) {
@@ -618,7 +731,7 @@ export default {
           reply = await handleSummary(env, parsed.range);
           break;
         case 'undo':
-          reply = await undoLastAction(env, userId);
+          reply = await undoLastAction(env, userId, parsed.which);
           break;
         default:
           reply = `🤷 Not sure what you meant. Try <code>help</code>.`;
