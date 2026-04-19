@@ -143,12 +143,32 @@ function extractPlatform(text) {
   return 'fb_marketplace'; // default
 }
 
-function extractPrice(text) {
-  // Look for $NN, NN dollars, or bare numbers (prefer $-prefixed)
+function extractPrice(text, skipValue) {
+  // Prefer explicit $-prefixed numbers (highest confidence)
   const dollar = text.match(/\$(\d+(?:\.\d{1,2})?)/);
   if (dollar) return parseFloat(dollar[1]);
-  const plain = text.match(/\b(\d+(?:\.\d{1,2})?)\s*(?:bucks|dollars)?\b/);
-  return plain ? parseFloat(plain[1]) : null;
+  // Next-best: "for N" or "at N" pattern
+  const forAt = text.match(/\b(?:for|at)\s+\$?(\d+(?:\.\d{1,2})?)\b/i);
+  if (forAt) return parseFloat(forAt[1]);
+  // Fallback: the LAST plain number in the string, skipping a specific value
+  // (used to avoid grabbing the qty number as the price)
+  const matches = [...text.matchAll(/\b(\d+(?:\.\d{1,2})?)\b/g)];
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const val = parseFloat(matches[i][1]);
+    if (skipValue != null && val === skipValue) continue;
+    return val;
+  }
+  return null;
+}
+
+function extractQty(text) {
+  // "sold 2 <word>" or "sell 5 of"
+  const m = text.match(/\b(?:sold|sell|sale|mark|marked)\s+(\d+)\s+\w/i);
+  if (m) {
+    const n = parseInt(m[1]);
+    if (n >= 1 && n <= 50) return n;
+  }
+  return 1;
 }
 
 function extractUnitCode(text) {
@@ -182,11 +202,13 @@ function parseCommand(text) {
 
   // Sold — multiple patterns
   // "sold <sku> <price> [platform]"
+  // "sold 2 <sku> for <price>"
   // "<sku> sold <price>"
   // "sold a <sku> for <price>"
   if (/\b(sold|sell|sale|gone)\b/i.test(t)) {
     const unitCode = extractUnitCode(raw);
-    const price = extractPrice(raw);
+    const qty = extractQty(raw);
+    const price = extractPrice(raw, qty > 1 ? qty : null);
     const platform = extractPlatform(raw);
     // Strip command words + price + platform to get what's left (the SKU name)
     let query = raw
@@ -196,7 +218,7 @@ function parseCommand(text) {
       .replace(new RegExp(unitCode || '__nomatch__', 'gi'), ' ')
       .replace(/\s+/g, ' ')
       .trim();
-    return { cmd: 'sold', query, price, platform, unitCode };
+    return { cmd: 'sold', query, price, platform, unitCode, qty };
   }
 
   // Damage
@@ -246,21 +268,21 @@ const HELP_TEXT = `<b>Lotsy commands</b>
 Default platform is FB Marketplace. Add <code>ebay</code>, <code>mercari</code>, or <code>offerup</code> to override.`;
 
 async function handleSold(env, parsed, userName) {
-  // Case 1: explicit unit code — mark that specific unit
+  // Case 1: explicit unit code — mark that specific unit (qty always 1)
   if (parsed.unitCode) {
     const rows = await loadUnitByCode(env, parsed.unitCode);
     const unit = rows[0];
     if (!unit) return `❌ Unit <code>${parsed.unitCode}</code> not found.`;
     if (unit.status === 'sold') return `⚠️ ${parsed.unitCode} is already sold.`;
 
-    if (!parsed.price) return `How much did ${unit.skus.name} (${parsed.unitCode}) sell for? Reply <code>${parsed.price || 22}</code> to confirm.`;
+    if (!parsed.price) return `How much did ${unit.skus.name} (${parsed.unitCode}) sell for? Reply <code>sold ${parsed.unitCode} 22</code>.`;
 
-    const sale = await insertSale(env, {
+    await insertSale(env, {
       unit_id: unit.id,
       platform: parsed.platform,
-      sold_price_usd: parsed.price,
+      sold_price: parsed.price,
       sold_at: new Date().toISOString(),
-      buyer_note: `via Telegram (${userName})`,
+      notes: `via Telegram (${userName})`,
     });
     await markUnitSold(env, unit.id);
 
@@ -268,7 +290,7 @@ async function handleSold(env, parsed, userName) {
     return `✅ Sold <b>${unit.skus.name}</b> (${parsed.unitCode}) for $${parsed.price} via ${platformLabel(parsed.platform)}.\n<i>${remaining.length} in stock.</i>`;
   }
 
-  // Case 2: SKU name/query — find the SKU and pick next available unit
+  // Case 2: SKU name/query — find the SKU and pick next available unit(s)
   if (!parsed.query) {
     return `I need a SKU name. Try: <code>sold busy book 22</code>`;
   }
@@ -276,6 +298,7 @@ async function handleSold(env, parsed, userName) {
     return `What price? Try: <code>sold ${parsed.query} 22</code>`;
   }
 
+  const qty = parsed.qty || 1;
   const skus = await loadSkus(env);
   const match = findSku(skus, parsed.query);
   if (!match.best) {
@@ -292,18 +315,32 @@ async function handleSold(env, parsed, userName) {
   if (availableUnits.length === 0) {
     return `❌ No ${sku.name} in stock.`;
   }
-  const unit = availableUnits[0];
+  if (availableUnits.length < qty) {
+    return `❌ Only ${availableUnits.length} ${sku.name} in stock (you asked for ${qty}).`;
+  }
 
-  const sale = await insertSale(env, {
-    unit_id: unit.id,
-    platform: parsed.platform,
-    sold_price_usd: parsed.price,
-    sold_at: new Date().toISOString(),
-    buyer_note: `via Telegram (${userName})`,
-  });
-  await markUnitSold(env, unit.id);
+  // Sell N units at $price each
+  const unitsToSell = availableUnits.slice(0, qty);
+  const soldCodes = [];
+  for (const unit of unitsToSell) {
+    await insertSale(env, {
+      unit_id: unit.id,
+      platform: parsed.platform,
+      sold_price: parsed.price,
+      sold_at: new Date().toISOString(),
+      notes: `via Telegram (${userName})`,
+    });
+    await markUnitSold(env, unit.id);
+    soldCodes.push(unit.unit_code);
+  }
 
-  return `✅ Sold <b>${sku.name}</b> (${unit.unit_code}) for $${parsed.price} via ${platformLabel(parsed.platform)}.\n<i>${availableUnits.length - 1} in stock. — ${userName}</i>`;
+  const remaining = availableUnits.length - qty;
+  if (qty === 1) {
+    return `✅ Sold <b>${sku.name}</b> (${soldCodes[0]}) for $${parsed.price} via ${platformLabel(parsed.platform)}.\n<i>${remaining} in stock. — ${userName}</i>`;
+  } else {
+    const total = (qty * parsed.price).toFixed(2);
+    return `✅ Sold <b>${qty}× ${sku.name}</b> at $${parsed.price} each = <b>$${total} total</b> via ${platformLabel(parsed.platform)}.\n<i>${remaining} in stock. — ${userName}</i>\n\nIf you meant "$${parsed.price} total" instead of "each", reply <code>undo</code>.`;
+  }
 }
 
 async function handleStock(env, parsed) {
@@ -402,7 +439,7 @@ async function handleSummary(env, range) {
     return `📊 <b>${range === 'today' ? 'Today' : range === 'week' ? 'This week' : 'All time'}</b>\nNo sales yet.`;
   }
 
-  const revenue = sales.reduce((s, r) => s + Number(r.sold_price_usd || 0), 0);
+  const revenue = sales.reduce((s, r) => s + Number(r.sold_price || 0), 0);
   const byPlatform = {};
   sales.forEach(s => {
     byPlatform[s.platform] = (byPlatform[s.platform] || 0) + 1;
