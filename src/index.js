@@ -511,10 +511,42 @@ export default {
     const chatId = message.chat.id;
     const text = message.text;
 
-    // Whitelist check
-    const allowed = (env.ALLOWED_USERS || '').split(',').map(s => s.trim());
+    // DEBUG LOGGING — visible in Cloudflare Observability Live logs
+    console.log(JSON.stringify({
+      event: 'incoming_message',
+      userId,
+      userName,
+      chatId,
+      chatType: message.chat.type,
+      text: text.slice(0, 100),
+      allowedUsersRaw: env.ALLOWED_USERS,
+    }));
+
+    // /whoami — works for everyone, no auth needed. Useful for onboarding.
+    if (/^\/?whoami\b/i.test(text.trim())) {
+      const allowed = (env.ALLOWED_USERS || '').split(',').map(s => s.trim()).filter(Boolean);
+      const isAuthed = allowed.includes(userId);
+      await sendMessage(env, chatId,
+        `<b>Your Telegram info</b>\n` +
+        `• User ID: <code>${userId}</code>\n` +
+        `• Name: ${userName}\n` +
+        `• Chat type: ${message.chat.type}\n` +
+        `• Authorized: ${isAuthed ? '✅ yes' : '❌ no'}\n\n` +
+        (isAuthed ? '' : `Ask the owner to add <code>${userId}</code> to ALLOWED_USERS.`)
+      );
+      return new Response('ok');
+    }
+
+    // Whitelist check — but reply with a helpful message instead of silent drop
+    const allowed = (env.ALLOWED_USERS || '').split(',').map(s => s.trim()).filter(Boolean);
     if (!allowed.includes(userId)) {
-      console.log(`Ignored message from unauthorized user ${userId} (${userName})`);
+      console.log(`Unauthorized user: ${userId} not in [${allowed.join(', ')}]`);
+      await sendMessage(env, chatId,
+        `👋 Hi ${userName}, I see your message but you're not on my allowlist.\n\n` +
+        `Your Telegram ID: <code>${userId}</code>\n` +
+        `(Currently allowed: <code>${allowed.join(', ') || '(none)'}</code>)\n\n` +
+        `Ask the owner to add your ID to the <code>ALLOWED_USERS</code> environment variable in Cloudflare, then message again.`
+      );
       return new Response('ok');
     }
 
