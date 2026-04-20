@@ -670,16 +670,58 @@ function platformLabel(p) {
 // ============================================================================
 
 async function loadActiveListings(env) {
-  // Listings in 'active' status + not paused from monitoring
-  return sb(env, 'GET',
-    'listings?status=eq.active&monitor_paused=eq.false&select=*,units(unit_code,sku_id,skus(name,sku_code))&order=created_at.asc'
-  );
+  // Two sources of active listings in Lotsy:
+  //   1. `listings` — one unit per listing (single-SKU listings)
+  //   2. `cluster_listings` — bundle activations (multiple units per listing)
+  // Both need to appear in the monitoring digest. We normalize them into a
+  // common shape so the rest of the system doesn't care which is which.
+
+  const [single, bundles] = await Promise.all([
+    sb(env, 'GET',
+      'listings?status=eq.active&monitor_paused=eq.false&select=id,listed_price,platform,created_at,check_score,check_notes,last_check_at,units(unit_code,sku_id,skus(name,sku_code))&order=created_at.asc'
+    ),
+    sb(env, 'GET',
+      'cluster_listings?status=eq.active&monitor_paused=eq.false&select=id,cluster_price,unit_ids,created_at,check_score,check_notes,last_check_at,cluster_id,clusters(name)&order=created_at.asc'
+    ).catch(() => []),  // gracefully handle if monitor_paused/check_* cols aren't on cluster_listings yet
+  ]);
+
+  const normalizedSingle = (single || []).map(l => ({
+    id: l.id,
+    kind: 'single',
+    name: l.units?.skus?.name || 'unknown',
+    display_code: l.units?.unit_code || '',
+    price: l.listed_price,
+    platform: l.platform || 'fb_marketplace',
+    created_at: l.created_at,
+    check_score: l.check_score,
+    check_notes: l.check_notes,
+    last_check_at: l.last_check_at,
+  }));
+
+  const normalizedBundles = (bundles || []).map(b => ({
+    id: b.id,
+    kind: 'bundle',
+    name: `🎁 ${b.clusters?.name || 'Bundle'}`,
+    display_code: `BUNDLE-${(b.id || '').slice(0, 8)}`,
+    price: b.cluster_price,
+    platform: 'fb_marketplace',  // bundles default to FB since that's where you list them
+    created_at: b.created_at,
+    check_score: b.check_score,
+    check_notes: b.check_notes,
+    last_check_at: b.last_check_at,
+    unit_count: (b.unit_ids || []).length,
+  }));
+
+  // Combine + sort by created_at
+  return [...normalizedSingle, ...normalizedBundles]
+    .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 }
 
-async function loadRecentMetrics(env, listingId, days = 14) {
+async function loadRecentMetrics(env, id, kind = 'single', days = 14) {
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const col = kind === 'bundle' ? 'cluster_listing_id' : 'listing_id';
   return sb(env, 'GET',
-    `listing_metrics?listing_id=eq.${listingId}&checked_at=gte.${since}&order=checked_at.desc`
+    `listing_metrics?${col}=eq.${id}&checked_at=gte.${since}&order=checked_at.desc`
   );
 }
 
@@ -773,12 +815,26 @@ function scoreOneListing(listing, metrics) {
   };
 }
 
-async function updateListingScore(env, listingId, scoreData) {
-  await sb(env, 'PATCH', `listings?id=eq.${listingId}`, {
+async function updateListingScore(env, target, scoreData) {
+  // target = { kind: 'single'|'bundle', id, created_at? }
+  const table = target.kind === 'bundle' ? 'cluster_listings' : 'listings';
+  await sb(env, 'PATCH', `${table}?id=eq.${target.id}`, {
     check_score: scoreData.score,
     check_notes: scoreData.notes,
     last_check_at: new Date().toISOString(),
   });
+}
+
+// Thin wrapper: accepts a target (may lack created_at) and fetches the listing
+// row if needed. Used by handleMetricsReply where we may not have created_at.
+async function scoreOneListingById(env, target, metrics) {
+  let listingShape = target;
+  if (!target.created_at) {
+    const table = target.kind === 'bundle' ? 'cluster_listings' : 'listings';
+    const rows = await sb(env, 'GET', `${table}?id=eq.${target.id}&select=created_at`);
+    listingShape = { ...target, created_at: rows[0]?.created_at || new Date().toISOString() };
+  }
+  return scoreOneListing(listingShape, metrics);
 }
 
 function determineRoundType() {
@@ -819,17 +875,15 @@ async function sendCheckRound(env, roundType) {
   const when = new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
 
   const lines = listings.map((l, i) => {
-    const sku = l.units?.skus;
-    const unitCode = l.units?.unit_code || '';
-    const name = sku?.name || l.units?.sku_id || 'unknown';
     const days = Math.floor((Date.now() - new Date(l.created_at).getTime()) / (24 * 60 * 60 * 1000));
     const platform = (l.platform || 'fb').replace('_marketplace', '').replace('fb', 'FB');
-    return `${i + 1}. ${name} <code>${unitCode}</code> · d${days} · $${l.listed_price} (${platform})`;
+    const bundleTag = l.kind === 'bundle' ? ` (${l.unit_count}pc)` : '';
+    return `${i + 1}. ${l.name}${bundleTag} · d${days} · $${l.price} (${platform})`;
   }).join('\n');
 
   const msg =
     `${emoji} <b>${timeLabel} check</b> · ${when}\n` +
-    `${listings.length} active listing${listings.length !== 1 ? 's' : ''}\n` +
+    `${listings.length} active listing${listings.length !== 1 ? 's' : ''} (single-SKUs + bundles)\n` +
     `${nudge}\n` +
     `${lines}\n\n` +
     `<b>Reply format:</b> one line per item\n` +
@@ -838,11 +892,13 @@ async function sendCheckRound(env, roundType) {
     `<code>3: skip</code>\n\n` +
     `Or just reply <code>skip</code> to skip the whole round.`;
 
-  // Create the round record
-  const roundRow = await sb(env, 'POST', 'monitor_rounds', {
+  // Create the round record — store composite IDs so we can route metrics back to the right table
+  // Format: "single:<uuid>" or "bundle:<uuid>" to know which table to update
+  const compositeIds = listings.map(l => `${l.kind}:${l.id}`);
+  await sb(env, 'POST', 'monitor_rounds', {
     round_type: roundType,
     telegram_user_id: userId,
-    listing_ids: listings.map(l => l.id),
+    listing_ids: compositeIds,
   });
 
   await sendMessage(env, userId, msg);
@@ -921,30 +977,30 @@ async function handleMetricsReply(env, userId, text) {
     return `⏭️ Skipped ${pending.round_type} round. You'll get the next one at its scheduled window.`;
   }
 
-  // Pull the listings for this round so we know how to map indices → listing_ids
-  const listingRows = await sb(env, 'GET',
-    `listings?id=in.(${pending.listing_ids.join(',')})&select=id,listed_price,units(unit_code,skus(name))`
-  );
-  // Re-order to match the order we sent them in (listing_ids order)
-  const orderedListings = pending.listing_ids
-    .map(id => listingRows.find(l => l.id === id))
-    .filter(Boolean);
+  // Parse composite IDs: "single:<uuid>" or "bundle:<uuid>"
+  // Fall back to treating as plain uuid for legacy rounds
+  const parsed = pending.listing_ids.map(id => {
+    if (typeof id !== 'string') return { kind: 'single', id };
+    const colon = id.indexOf(':');
+    if (colon === -1) return { kind: 'single', id };
+    return { kind: id.slice(0, colon), id: id.slice(colon + 1) };
+  });
 
   let logged = 0, skipped = 0, errors = [];
 
   for (const u of updates) {
-    if (u.index < 1 || u.index > orderedListings.length) {
+    if (u.index < 1 || u.index > parsed.length) {
       errors.push(`#${u.index} out of range`);
       continue;
     }
-    const listing = orderedListings[u.index - 1];
-    if (u.skipped) {
-      skipped++;
-      continue;
-    }
+    const target = parsed[u.index - 1];
+    if (u.skipped) { skipped++; continue; }
+
     try {
+      // Metrics row — store which table the ID points to via source
       await sb(env, 'POST', 'listing_metrics', {
-        listing_id: listing.id,
+        listing_id: target.kind === 'single' ? target.id : null,
+        cluster_listing_id: target.kind === 'bundle' ? target.id : null,
         views: u.views,
         saves: u.saves,
         messages: u.messages,
@@ -953,27 +1009,21 @@ async function handleMetricsReply(env, userId, text) {
       });
       logged++;
 
-      // Re-score the listing with fresh data
-      const metrics = await loadRecentMetrics(env, listing.id);
-      const scoreData = scoreOneListing(listing, metrics);
-      await updateListingScore(env, listing.id, scoreData);
+      // Re-score using fresh metrics
+      const metrics = await loadRecentMetrics(env, target.id, target.kind);
+      const scoreData = scoreOneListingById(env, target, metrics);
+      await updateListingScore(env, target, scoreData);
     } catch (e) {
       errors.push(`#${u.index}: ${e.message?.slice(0, 60)}`);
     }
   }
 
-  // Mark round as responded
-  await sb(env, 'PATCH', `monitor_rounds?id=eq.${pending.id}`, {
-    responded_at: nowIso,
-  });
+  await sb(env, 'PATCH', `monitor_rounds?id=eq.${pending.id}`, { responded_at: nowIso });
 
-  // Build recap with score changes
-  const allListingsNow = await sb(env, 'GET',
-    `listings?id=in.(${pending.listing_ids.join(',')})&select=id,check_score,check_notes,listed_price,units(unit_code,skus(name))`
-  );
-
+  // Reload everything for recap
+  const allNow = await loadActiveListings(env);
   const byScore = { hot: [], slow: [], cold: [], dead: [], fine: [], new: [] };
-  for (const l of allListingsNow) {
+  for (const l of allNow) {
     const s = l.check_score || 'fine';
     if (byScore[s]) byScore[s].push(l);
   }
@@ -983,26 +1033,14 @@ async function handleMetricsReply(env, userId, text) {
   if (errors.length) recap += `\n⚠️ Errors: ${errors.slice(0, 3).join('; ')}`;
   recap += '\n';
 
-  const fmt = (l) => `• ${l.units?.skus?.name || 'unknown'} <code>${l.units?.unit_code || ''}</code> — $${l.listed_price}\n   <i>${l.check_notes || '—'}</i>`;
+  const fmt = (l) => `• ${l.name} — $${l.price}\n   <i>${l.check_notes || '—'}</i>`;
 
-  if (byScore.hot.length > 0) {
-    recap += `\n🔥 <b>HOT</b> (${byScore.hot.length})\n` + byScore.hot.map(fmt).join('\n') + '\n';
-  }
-  if (byScore.slow.length > 0) {
-    recap += `\n🐢 <b>SLOW</b> (${byScore.slow.length})\n` + byScore.slow.map(fmt).join('\n') + '\n';
-  }
-  if (byScore.cold.length > 0) {
-    recap += `\n❄️ <b>COLD</b> (${byScore.cold.length})\n` + byScore.cold.map(fmt).join('\n') + '\n';
-  }
-  if (byScore.dead.length > 0) {
-    recap += `\n☠️ <b>DEAD</b> (${byScore.dead.length})\n` + byScore.dead.map(fmt).join('\n') + '\n';
-  }
-  if (byScore.fine.length > 0) {
-    recap += `\n✅ ${byScore.fine.length} on track\n`;
-  }
-  if (byScore.new.length > 0) {
-    recap += `\n✨ ${byScore.new.length} too new to score\n`;
-  }
+  if (byScore.hot.length > 0)  recap += `\n🔥 <b>HOT</b> (${byScore.hot.length})\n${byScore.hot.map(fmt).join('\n')}\n`;
+  if (byScore.slow.length > 0) recap += `\n🐢 <b>SLOW</b> (${byScore.slow.length})\n${byScore.slow.map(fmt).join('\n')}\n`;
+  if (byScore.cold.length > 0) recap += `\n❄️ <b>COLD</b> (${byScore.cold.length})\n${byScore.cold.map(fmt).join('\n')}\n`;
+  if (byScore.dead.length > 0) recap += `\n☠️ <b>DEAD</b> (${byScore.dead.length})\n${byScore.dead.map(fmt).join('\n')}\n`;
+  if (byScore.fine.length > 0) recap += `\n✅ ${byScore.fine.length} on track\n`;
+  if (byScore.new.length > 0)  recap += `\n✨ ${byScore.new.length} too new to score\n`;
 
   return recap;
 }
@@ -1015,29 +1053,32 @@ async function handleDigest(env, userId) {
 
   // Re-score everything using existing metrics
   for (const l of listings) {
-    const metrics = await loadRecentMetrics(env, l.id);
+    const metrics = await loadRecentMetrics(env, l.id, l.kind);
     const scoreData = scoreOneListing(l, metrics);
-    await updateListingScore(env, l.id, scoreData);
+    await updateListingScore(env, { kind: l.kind, id: l.id }, scoreData);
+    // Update local copy for the recap below
+    l.check_score = scoreData.score;
+    l.check_notes = scoreData.notes;
   }
 
   const byScore = { hot: [], slow: [], cold: [], dead: [], fine: [], new: [] };
-  const fresh = await sb(env, 'GET',
-    `listings?status=eq.active&monitor_paused=eq.false&select=id,check_score,check_notes,listed_price,created_at,units(unit_code,skus(name))&order=created_at.asc`
-  );
-  for (const l of fresh) {
+  for (const l of listings) {
     const s = l.check_score || 'fine';
     if (byScore[s]) byScore[s].push(l);
   }
 
-  const fmt = (l) => `• ${l.units?.skus?.name || '?'} <code>${l.units?.unit_code || ''}</code> — $${l.listed_price}\n   <i>${l.check_notes || '—'}</i>`;
+  const fmt = (l) => {
+    const bundleTag = l.kind === 'bundle' ? ` (${l.unit_count}pc)` : '';
+    return `• ${l.name}${bundleTag} — $${l.price}\n   <i>${l.check_notes || '—'}</i>`;
+  };
 
   let msg = `📊 <b>Lotsy digest</b> · ${listings.length} active\n`;
-  if (byScore.hot.length > 0) msg += `\n🔥 <b>HOT</b> (${byScore.hot.length})\n${byScore.hot.map(fmt).join('\n')}\n`;
+  if (byScore.hot.length > 0)  msg += `\n🔥 <b>HOT</b> (${byScore.hot.length})\n${byScore.hot.map(fmt).join('\n')}\n`;
   if (byScore.slow.length > 0) msg += `\n🐢 <b>SLOW</b> (${byScore.slow.length})\n${byScore.slow.map(fmt).join('\n')}\n`;
   if (byScore.cold.length > 0) msg += `\n❄️ <b>COLD</b> (${byScore.cold.length})\n${byScore.cold.map(fmt).join('\n')}\n`;
   if (byScore.dead.length > 0) msg += `\n☠️ <b>DEAD</b> (${byScore.dead.length})\n${byScore.dead.map(fmt).join('\n')}\n`;
   if (byScore.fine.length > 0) msg += `\n✅ FINE (${byScore.fine.length}) — on track\n`;
-  if (byScore.new.length > 0) msg += `\n✨ NEW (${byScore.new.length}) — too early\n`;
+  if (byScore.new.length > 0)  msg += `\n✨ NEW (${byScore.new.length}) — too early\n`;
 
   return msg;
 }
