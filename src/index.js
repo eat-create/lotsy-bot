@@ -201,6 +201,21 @@ function parseCommand(text) {
     return { cmd: 'stock', query: stockMatch[1].trim() };
   }
 
+  // Digest — current status of all active listings
+  if (/^(digest|status|brief|performance)$/i.test(t)) return { cmd: 'digest' };
+
+  // Pause/resume monitoring on a specific unit
+  const pauseMatch = t.match(/^(?:pause|mute)\s+([A-Z]{2,4}-\d{2,4}-A\d{1,5})$/i);
+  if (pauseMatch) return { cmd: 'pause_monitor', unitCode: pauseMatch[1].toUpperCase() };
+  const resumeMatch = t.match(/^(?:resume|unmute)\s+([A-Z]{2,4}-\d{2,4}-A\d{1,5})$/i);
+  if (resumeMatch) return { cmd: 'resume_monitor', unitCode: resumeMatch[1].toUpperCase() };
+
+  // Metrics reply — detected by shape (contains "N: ..." pattern)
+  // This goes AFTER word-based commands so "stock", "sold" etc don't get misrouted.
+  if (looksLikeMetricsReply(raw)) {
+    return { cmd: 'metrics_reply', text: raw };
+  }
+
   // Sold — multiple patterns
   // "sold <sku> <price> [platform]"
   // "sold 2 <sku> for <price>"
@@ -267,6 +282,13 @@ const HELP_TEXT = `<b>Lotsy commands</b>
 • <code>undo</code> — shows last 5 actions, pick which to reverse
 • <code>undo 3</code> — reverses action #3 from the list
 • <code>undo last</code> — reverses the most recent action
+
+<b>Listing performance</b>
+• <code>digest</code> — current status of all active listings
+• Reply to a check round with lines like <code>1: 12 2 0</code>
+• <code>skip</code> — skip the current round
+• <code>pause QM-001-A015</code> — stop monitoring a listing
+• <code>resume QM-001-A015</code> — turn monitoring back on
 
 Default platform is FB Marketplace. Add <code>ebay</code>, <code>mercari</code>, or <code>offerup</code> to override.`;
 
@@ -627,8 +649,417 @@ function platformLabel(p) {
 }
 
 // ============================================================================
-// MAIN HANDLER
+// LISTING MONITORING — manual performance tracking via Telegram
+// ---------------------------------------------------------------------------
+// Kyle gets 3 pings/day (morning/afternoon/evening) listing all active
+// listings with a number. He replies with "N: views saves messages" per line.
+// Bot parses, stores metrics, scores each listing, and flags recommendations.
+//
+// Schedule (jittered daily by cron trigger in wrangler.toml):
+//   Morning window:   08:00 – 11:00
+//   Afternoon window: 13:00 – 16:00
+//   Evening window:   19:00 – 22:00
+//
+// Scoring:
+//   NEW   — days < 3
+//   HOT   — views/day >= 10 or messages >= 3 in last 7 days
+//   FINE  — views/day 3-10, no red flags
+//   SLOW  — views/day < 3 after day 7 OR 0 messages by day 7
+//   COLD  — age 21-30 days regardless of velocity
+//   DEAD  — age 30+ days, needs action
 // ============================================================================
+
+async function loadActiveListings(env) {
+  // Listings in 'active' status + not paused from monitoring
+  return sb(env, 'GET',
+    'listings?status=eq.active&monitor_paused=eq.false&select=*,units(unit_code,sku_id,skus(name,sku_code))&order=created_at.asc'
+  );
+}
+
+async function loadRecentMetrics(env, listingId, days = 14) {
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  return sb(env, 'GET',
+    `listing_metrics?listing_id=eq.${listingId}&checked_at=gte.${since}&order=checked_at.desc`
+  );
+}
+
+async function loadPendingRound(env, userId) {
+  // Find the most recent round that hasn't been responded to yet
+  const rows = await sb(env, 'GET',
+    `monitor_rounds?telegram_user_id=eq.${userId}&responded_at=is.null&order=sent_at.desc&limit=1`
+  );
+  return rows[0] || null;
+}
+
+function scoreOneListing(listing, metrics) {
+  // metrics: array of { checked_at, views, saves, messages } sorted DESC (newest first)
+  const createdAt = new Date(listing.created_at);
+  const ageDays = Math.floor((Date.now() - createdAt.getTime()) / (24 * 60 * 60 * 1000));
+
+  // Filter to last 7 days for velocity calculation
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const recent = metrics.filter(m => new Date(m.checked_at).getTime() >= sevenDaysAgo && m.views != null);
+
+  if (recent.length === 0) {
+    return {
+      score: ageDays < 3 ? 'new' : 'fine',
+      notes: ageDays < 3 ? 'Just posted, need more data.' : 'No recent metric data.',
+      ageDays,
+      latestViews: null, latestSaves: null, latestMessages: null,
+      viewsPerDay: null, totalMessages: null,
+    };
+  }
+
+  // Latest snapshot values
+  const latest = recent[0];
+  const oldest = recent[recent.length - 1];
+
+  // Views-per-day over the observation window
+  const windowDays = Math.max(1,
+    (new Date(latest.checked_at).getTime() - new Date(oldest.checked_at).getTime()) / (24 * 60 * 60 * 1000)
+  );
+  const viewsDelta = Number(latest.views) - Number(oldest.views || 0);
+  const viewsPerDay = windowDays > 0 ? Math.max(0, viewsDelta / windowDays)
+    : Number(latest.views || 0);
+
+  // Total messages over recent window
+  const totalMessages = Math.max(...recent.map(m => Number(m.messages) || 0));
+  const totalSaves = Math.max(...recent.map(m => Number(m.saves) || 0));
+
+  // === Scoring rules ===
+  let score, notes;
+
+  if (ageDays < 3) {
+    score = 'new';
+    notes = 'Too early to tell. Check back in a few days.';
+  } else if (ageDays >= 30) {
+    score = 'dead';
+    notes = 'Over 30 days listed. Delist, bundle into clearance, or drop 30-40%.';
+  } else if (ageDays >= 21) {
+    score = 'cold';
+    notes = 'Stale. Try dropping price 25-30%, adding a new hero photo, or bundling.';
+  } else if (viewsPerDay >= 10 || totalMessages >= 3) {
+    score = 'hot';
+    if (totalMessages >= 3 && viewsPerDay >= 10) {
+      notes = `Strong traffic + buyer interest. You're likely underpricing — try raising 10-15%.`;
+    } else if (totalMessages >= 3) {
+      notes = 'Buyers are messaging — consider raising price or holding firm on offers.';
+    } else {
+      notes = `High views (${viewsPerDay.toFixed(1)}/day) but few msgs. Good demand — test a price bump.`;
+    }
+  } else if (ageDays >= 14 && viewsPerDay < 3) {
+    score = 'slow';
+    notes = 'Two weeks with weak traffic. Drop price 15-20% and refresh the hero photo.';
+  } else if (ageDays >= 7 && viewsPerDay < 3) {
+    score = 'slow';
+    notes = `Week in with only ${viewsPerDay.toFixed(1)} views/day. Title + hero photo may need work.`;
+  } else if (ageDays >= 7 && totalMessages === 0 && viewsPerDay >= 5) {
+    score = 'slow';
+    notes = `Decent views (${viewsPerDay.toFixed(1)}/d) but 0 messages. Rework title/description — or price is scaring buyers.`;
+  } else if (ageDays >= 5 && viewsPerDay >= 10 && totalSaves === 0) {
+    score = 'slow';
+    notes = 'High views but no saves — wrong category or hero photo missing the mark.';
+  } else {
+    score = 'fine';
+    notes = `On track: ${viewsPerDay.toFixed(1)} views/day, ${totalMessages} msgs in last 7d.`;
+  }
+
+  return {
+    score, notes, ageDays,
+    latestViews: Number(latest.views) || 0,
+    latestSaves: Number(latest.saves) || 0,
+    latestMessages: Number(latest.messages) || 0,
+    viewsPerDay, totalMessages,
+  };
+}
+
+async function updateListingScore(env, listingId, scoreData) {
+  await sb(env, 'PATCH', `listings?id=eq.${listingId}`, {
+    check_score: scoreData.score,
+    check_notes: scoreData.notes,
+    last_check_at: new Date().toISOString(),
+  });
+}
+
+function determineRoundType() {
+  // Based on current UTC hour, guess which window we're in
+  // Assumes Kyle is in US Central (UTC-5 or UTC-6). Adjust if needed.
+  const utcHour = new Date().getUTCHours();
+  // Rough mapping for Central time
+  if (utcHour >= 13 && utcHour < 17) return 'morning';     // 08:00-12:00 CT
+  if (utcHour >= 18 && utcHour < 22) return 'afternoon';   // 13:00-17:00 CT
+  return 'evening';                                         // 19:00+ CT
+}
+
+async function sendCheckRound(env, roundType) {
+  const listings = await loadActiveListings(env);
+  if (!listings || listings.length === 0) {
+    console.log(`Round ${roundType}: no active listings, skipping`);
+    return;
+  }
+
+  const userId = (env.ALLOWED_USERS || '').split(',').map(s => s.trim())[0];
+  if (!userId) {
+    console.error('No primary user in ALLOWED_USERS — cannot send check round');
+    return;
+  }
+
+  // Check if there's an unresponded prior round to nudge about
+  const pending = await loadPendingRound(env, userId);
+  let nudge = '';
+  if (pending && !pending.reminded) {
+    const missedType = pending.round_type;
+    nudge = `\n<i>⏰ Also: you didn't reply to the ${missedType} check. Include those numbers here or reply "skip" to ignore.</i>\n`;
+    await sb(env, 'PATCH', `monitor_rounds?id=eq.${pending.id}`, { reminded: true });
+  }
+
+  // Build the numbered message
+  const emoji = roundType === 'morning' ? '☀️' : roundType === 'afternoon' ? '🌤' : '🌙';
+  const timeLabel = roundType[0].toUpperCase() + roundType.slice(1);
+  const when = new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+
+  const lines = listings.map((l, i) => {
+    const sku = l.units?.skus;
+    const unitCode = l.units?.unit_code || '';
+    const name = sku?.name || l.units?.sku_id || 'unknown';
+    const days = Math.floor((Date.now() - new Date(l.created_at).getTime()) / (24 * 60 * 60 * 1000));
+    const platform = (l.platform || 'fb').replace('_marketplace', '').replace('fb', 'FB');
+    return `${i + 1}. ${name} <code>${unitCode}</code> · d${days} · $${l.listed_price} (${platform})`;
+  }).join('\n');
+
+  const msg =
+    `${emoji} <b>${timeLabel} check</b> · ${when}\n` +
+    `${listings.length} active listing${listings.length !== 1 ? 's' : ''}\n` +
+    `${nudge}\n` +
+    `${lines}\n\n` +
+    `<b>Reply format:</b> one line per item\n` +
+    `<code>1: views saves messages</code>\n` +
+    `<code>2: 12 2 0</code>\n` +
+    `<code>3: skip</code>\n\n` +
+    `Or just reply <code>skip</code> to skip the whole round.`;
+
+  // Create the round record
+  const roundRow = await sb(env, 'POST', 'monitor_rounds', {
+    round_type: roundType,
+    telegram_user_id: userId,
+    listing_ids: listings.map(l => l.id),
+  });
+
+  await sendMessage(env, userId, msg);
+  console.log(`Sent ${roundType} round to ${userId} with ${listings.length} listings`);
+}
+
+// Parse a user reply containing multi-line metric updates.
+// Accepts formats:
+//   "1: 12 2 0"
+//   "1 12 2 0"
+//   "1: skip"
+// Returns { updates: [{ index, views, saves, messages, skipped }], skipAll }
+function parseMetricsReply(text) {
+  const trimmed = text.trim();
+  // Global skip
+  if (/^skip$/i.test(trimmed)) return { skipAll: true, updates: [] };
+
+  const updates = [];
+  const lines = trimmed.split(/\r?\n/);
+  for (const line of lines) {
+    const clean = line.trim();
+    if (!clean) continue;
+    // Match: "N: v s m" or "N v s m" or "N: skip"
+    const skipMatch = clean.match(/^(\d+)[\s:.)]*\s*skip\b/i);
+    if (skipMatch) {
+      updates.push({ index: parseInt(skipMatch[1]), skipped: true });
+      continue;
+    }
+    const m = clean.match(/^(\d+)[\s:.)]*\s+(\d+)\s+(\d+)\s+(\d+)$/);
+    if (m) {
+      updates.push({
+        index: parseInt(m[1]),
+        views: parseInt(m[2]),
+        saves: parseInt(m[3]),
+        messages: parseInt(m[4]),
+      });
+      continue;
+    }
+    // Match without separators e.g. just "5 10 0 1"
+    const m2 = clean.match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/);
+    if (m2) {
+      updates.push({
+        index: parseInt(m2[1]),
+        views: parseInt(m2[2]),
+        saves: parseInt(m2[3]),
+        messages: parseInt(m2[4]),
+      });
+    }
+  }
+  return { skipAll: false, updates };
+}
+
+function looksLikeMetricsReply(text) {
+  // Heuristic: has at least one line matching "N: ..." or is bare "skip"
+  const t = text.trim();
+  if (/^skip$/i.test(t)) return true;
+  const lines = t.split(/\r?\n/).filter(Boolean);
+  if (lines.length === 0) return false;
+  return lines.some(l => /^\d+[\s:.)]/.test(l.trim()));
+}
+
+async function handleMetricsReply(env, userId, text) {
+  const pending = await loadPendingRound(env, userId);
+  if (!pending) {
+    return `🤔 No check round is pending. Try <code>digest</code> to see current status, or wait for the next check ping.`;
+  }
+
+  const { skipAll, updates } = parseMetricsReply(text);
+  const batchId = pending.id;
+  const nowIso = new Date().toISOString();
+
+  if (skipAll || updates.length === 0) {
+    await sb(env, 'PATCH', `monitor_rounds?id=eq.${pending.id}`, {
+      responded_at: nowIso, skipped: true,
+    });
+    return `⏭️ Skipped ${pending.round_type} round. You'll get the next one at its scheduled window.`;
+  }
+
+  // Pull the listings for this round so we know how to map indices → listing_ids
+  const listingRows = await sb(env, 'GET',
+    `listings?id=in.(${pending.listing_ids.join(',')})&select=id,listed_price,units(unit_code,skus(name))`
+  );
+  // Re-order to match the order we sent them in (listing_ids order)
+  const orderedListings = pending.listing_ids
+    .map(id => listingRows.find(l => l.id === id))
+    .filter(Boolean);
+
+  let logged = 0, skipped = 0, errors = [];
+
+  for (const u of updates) {
+    if (u.index < 1 || u.index > orderedListings.length) {
+      errors.push(`#${u.index} out of range`);
+      continue;
+    }
+    const listing = orderedListings[u.index - 1];
+    if (u.skipped) {
+      skipped++;
+      continue;
+    }
+    try {
+      await sb(env, 'POST', 'listing_metrics', {
+        listing_id: listing.id,
+        views: u.views,
+        saves: u.saves,
+        messages: u.messages,
+        source: 'telegram_manual',
+        check_batch_id: batchId,
+      });
+      logged++;
+
+      // Re-score the listing with fresh data
+      const metrics = await loadRecentMetrics(env, listing.id);
+      const scoreData = scoreOneListing(listing, metrics);
+      await updateListingScore(env, listing.id, scoreData);
+    } catch (e) {
+      errors.push(`#${u.index}: ${e.message?.slice(0, 60)}`);
+    }
+  }
+
+  // Mark round as responded
+  await sb(env, 'PATCH', `monitor_rounds?id=eq.${pending.id}`, {
+    responded_at: nowIso,
+  });
+
+  // Build recap with score changes
+  const allListingsNow = await sb(env, 'GET',
+    `listings?id=in.(${pending.listing_ids.join(',')})&select=id,check_score,check_notes,listed_price,units(unit_code,skus(name))`
+  );
+
+  const byScore = { hot: [], slow: [], cold: [], dead: [], fine: [], new: [] };
+  for (const l of allListingsNow) {
+    const s = l.check_score || 'fine';
+    if (byScore[s]) byScore[s].push(l);
+  }
+
+  let recap = `✅ Logged ${logged} listing${logged !== 1 ? 's' : ''}`;
+  if (skipped > 0) recap += `, skipped ${skipped}`;
+  if (errors.length) recap += `\n⚠️ Errors: ${errors.slice(0, 3).join('; ')}`;
+  recap += '\n';
+
+  const fmt = (l) => `• ${l.units?.skus?.name || 'unknown'} <code>${l.units?.unit_code || ''}</code> — $${l.listed_price}\n   <i>${l.check_notes || '—'}</i>`;
+
+  if (byScore.hot.length > 0) {
+    recap += `\n🔥 <b>HOT</b> (${byScore.hot.length})\n` + byScore.hot.map(fmt).join('\n') + '\n';
+  }
+  if (byScore.slow.length > 0) {
+    recap += `\n🐢 <b>SLOW</b> (${byScore.slow.length})\n` + byScore.slow.map(fmt).join('\n') + '\n';
+  }
+  if (byScore.cold.length > 0) {
+    recap += `\n❄️ <b>COLD</b> (${byScore.cold.length})\n` + byScore.cold.map(fmt).join('\n') + '\n';
+  }
+  if (byScore.dead.length > 0) {
+    recap += `\n☠️ <b>DEAD</b> (${byScore.dead.length})\n` + byScore.dead.map(fmt).join('\n') + '\n';
+  }
+  if (byScore.fine.length > 0) {
+    recap += `\n✅ ${byScore.fine.length} on track\n`;
+  }
+  if (byScore.new.length > 0) {
+    recap += `\n✨ ${byScore.new.length} too new to score\n`;
+  }
+
+  return recap;
+}
+
+async function handleDigest(env, userId) {
+  const listings = await loadActiveListings(env);
+  if (!listings || listings.length === 0) {
+    return '📊 No active listings to score.';
+  }
+
+  // Re-score everything using existing metrics
+  for (const l of listings) {
+    const metrics = await loadRecentMetrics(env, l.id);
+    const scoreData = scoreOneListing(l, metrics);
+    await updateListingScore(env, l.id, scoreData);
+  }
+
+  const byScore = { hot: [], slow: [], cold: [], dead: [], fine: [], new: [] };
+  const fresh = await sb(env, 'GET',
+    `listings?status=eq.active&monitor_paused=eq.false&select=id,check_score,check_notes,listed_price,created_at,units(unit_code,skus(name))&order=created_at.asc`
+  );
+  for (const l of fresh) {
+    const s = l.check_score || 'fine';
+    if (byScore[s]) byScore[s].push(l);
+  }
+
+  const fmt = (l) => `• ${l.units?.skus?.name || '?'} <code>${l.units?.unit_code || ''}</code> — $${l.listed_price}\n   <i>${l.check_notes || '—'}</i>`;
+
+  let msg = `📊 <b>Lotsy digest</b> · ${listings.length} active\n`;
+  if (byScore.hot.length > 0) msg += `\n🔥 <b>HOT</b> (${byScore.hot.length})\n${byScore.hot.map(fmt).join('\n')}\n`;
+  if (byScore.slow.length > 0) msg += `\n🐢 <b>SLOW</b> (${byScore.slow.length})\n${byScore.slow.map(fmt).join('\n')}\n`;
+  if (byScore.cold.length > 0) msg += `\n❄️ <b>COLD</b> (${byScore.cold.length})\n${byScore.cold.map(fmt).join('\n')}\n`;
+  if (byScore.dead.length > 0) msg += `\n☠️ <b>DEAD</b> (${byScore.dead.length})\n${byScore.dead.map(fmt).join('\n')}\n`;
+  if (byScore.fine.length > 0) msg += `\n✅ FINE (${byScore.fine.length}) — on track\n`;
+  if (byScore.new.length > 0) msg += `\n✨ NEW (${byScore.new.length}) — too early\n`;
+
+  return msg;
+}
+
+async function handlePauseMonitor(env, unitCode, pause) {
+  const rows = await loadUnitByCode(env, unitCode);
+  const unit = rows[0];
+  if (!unit) return `❌ Unit <code>${unitCode}</code> not found.`;
+
+  const listings = await sb(env, 'GET',
+    `listings?unit_id=eq.${unit.id}&status=eq.active&select=id,units(skus(name))`
+  );
+  if (listings.length === 0) return `❌ No active listing for ${unitCode}.`;
+
+  for (const l of listings) {
+    await sb(env, 'PATCH', `listings?id=eq.${l.id}`, { monitor_paused: pause });
+  }
+  const name = listings[0].units?.skus?.name || unitCode;
+  return pause
+    ? `🔕 Paused monitoring for <b>${name}</b> (${unitCode}). Use <code>resume ${unitCode}</code> to turn back on.`
+    : `🔔 Resumed monitoring for <b>${name}</b> (${unitCode}).`;
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -733,6 +1164,18 @@ export default {
         case 'undo':
           reply = await undoLastAction(env, userId, parsed.which);
           break;
+        case 'digest':
+          reply = await handleDigest(env, userId);
+          break;
+        case 'metrics_reply':
+          reply = await handleMetricsReply(env, userId, parsed.text);
+          break;
+        case 'pause_monitor':
+          reply = await handlePauseMonitor(env, parsed.unitCode, true);
+          break;
+        case 'resume_monitor':
+          reply = await handlePauseMonitor(env, parsed.unitCode, false);
+          break;
         default:
           reply = `🤷 Not sure what you meant. Try <code>help</code>.`;
       }
@@ -744,5 +1187,24 @@ export default {
     }
 
     return new Response('ok');
+  },
+
+  // ============================================================================
+  // CRON TRIGGER — fires at scheduled times to send check-in rounds
+  // ============================================================================
+  // Wrangler.toml defines 3 crons (morning/afternoon/evening windows).
+  // Each fires within its window; within the handler we add small jitter
+  // so consecutive days don't land at identical clock times.
+  async scheduled(controller, env, ctx) {
+    const roundType = determineRoundType();
+    // Add a random delay of 0-15 min to vary the exact send time
+    const jitterMs = Math.floor(Math.random() * 15 * 60 * 1000);
+    await new Promise(r => setTimeout(r, Math.min(jitterMs, 25000))); // cap at 25s to stay within worker runtime
+
+    try {
+      await sendCheckRound(env, roundType);
+    } catch (e) {
+      console.error('Scheduled round failed:', e.message);
+    }
   },
 };
