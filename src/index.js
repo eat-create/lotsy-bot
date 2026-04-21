@@ -1104,6 +1104,8 @@ async function handlePauseMonitor(env, unitCode, pause) {
 
 export default {
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
     // Health check
     if (request.method === 'GET') {
       return new Response('Lotsy Telegram Bot — alive 🟢', {
@@ -1113,6 +1115,115 @@ export default {
 
     if (request.method !== 'POST') {
       return new Response('Method not allowed', { status: 405 });
+    }
+
+    // === Vision product-ID endpoint ===
+    // POST /vision-lookup with { image: "data:image/jpeg;base64,..." }
+    // Returns { title, brand, category, description, suggested_price_range }
+    // CORS-enabled for browser calls from Lotsy PWA.
+    if (url.pathname === '/vision-lookup') {
+      // CORS preflight handled above implicitly, but be explicit on real POST
+      const corsHeaders = {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
+        'Content-Type': 'application/json',
+      };
+      try {
+        if (!env.ANTHROPIC_API_KEY) {
+          return new Response(JSON.stringify({ error: 'Vision lookup not configured on server' }),
+            { status: 503, headers: corsHeaders });
+        }
+        const body = await request.json();
+        if (!body.image || typeof body.image !== 'string') {
+          return new Response(JSON.stringify({ error: 'Missing image field' }),
+            { status: 400, headers: corsHeaders });
+        }
+        // Strip data URL prefix if present
+        const m = body.image.match(/^data:(image\/[^;]+);base64,(.+)$/);
+        if (!m) {
+          return new Response(JSON.stringify({ error: 'Image must be a base64 data URL' }),
+            { status: 400, headers: corsHeaders });
+        }
+        const mediaType = m[1];
+        const base64 = m[2];
+
+        const prompt = `You are identifying a consumer product from a photo. Return ONLY a JSON object with these fields (no other text, no markdown):
+{
+  "title": "product name (concise, e.g. 'Dasani Purified Water 20oz Bottle')",
+  "brand": "brand name or null if unknown",
+  "category": "one of: beverage, food, household, toy, electronics, beauty, apparel, book, other",
+  "description": "2-3 sentence product description for a resale listing",
+  "suggested_retail_low": 0,
+  "suggested_retail_high": 0,
+  "confidence": "high | medium | low"
+}
+
+If you cannot identify the product at all, return {"title": null, "confidence": "low"}. Be honest about confidence.`;
+
+        const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': env.ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify({
+            model: 'claude-haiku-4-5-20251001',  // fast + cheap for classification
+            max_tokens: 500,
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
+                { type: 'text', text: prompt },
+              ],
+            }],
+          }),
+        });
+
+        if (!anthropicRes.ok) {
+          const errText = await anthropicRes.text();
+          console.error('Anthropic error:', errText);
+          return new Response(JSON.stringify({ error: `Vision API error: ${anthropicRes.status}` }),
+            { status: 502, headers: corsHeaders });
+        }
+
+        const data = await anthropicRes.json();
+        const textBlock = (data.content || []).find(c => c.type === 'text');
+        if (!textBlock) {
+          return new Response(JSON.stringify({ error: 'No response from vision model' }),
+            { status: 502, headers: corsHeaders });
+        }
+
+        // Parse JSON — strip code fences if model added them
+        const clean = textBlock.text.trim().replace(/^```json\s*|\s*```$/g, '').trim();
+        let parsed;
+        try {
+          parsed = JSON.parse(clean);
+        } catch (e) {
+          return new Response(JSON.stringify({ error: 'Invalid JSON from vision', raw: clean }),
+            { status: 502, headers: corsHeaders });
+        }
+
+        return new Response(JSON.stringify({ ok: true, result: parsed }),
+          { status: 200, headers: corsHeaders });
+      } catch (e) {
+        console.error('Vision endpoint error:', e);
+        return new Response(JSON.stringify({ error: e.message || 'Vision lookup failed' }),
+          { status: 500, headers: corsHeaders });
+      }
+    }
+
+    // Handle OPTIONS preflight for CORS
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type',
+        },
+      });
     }
 
     let update;
