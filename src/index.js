@@ -1106,6 +1106,20 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // CORS preflight — must be handled BEFORE the method-not-allowed guard.
+    // Browser sends OPTIONS before any cross-origin POST with JSON body.
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type',
+          'Access-Control-Max-Age': '86400',
+        },
+      });
+    }
+
     // Health check
     if (request.method === 'GET') {
       return new Response('Lotsy Telegram Bot — alive 🟢', {
@@ -1259,17 +1273,7 @@ If you cannot identify the product at all, return {"title": null, "confidence": 
       }
     }
 
-    // Handle OPTIONS preflight for CORS
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type',
-        },
-      });
-    }
+    // OPTIONS preflight handled at top of handler.
 
     let update;
     try {
