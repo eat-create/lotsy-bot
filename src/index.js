@@ -1148,7 +1148,38 @@ export default {
         const mediaType = m[1];
         const base64 = m[2];
 
-        const prompt = `You are identifying a consumer product from a photo. Return ONLY a JSON object with these fields (no other text, no markdown):
+        // === MODE: multi_item_scan (bulk inventory intake) ===
+        // Returns array of products visible in frame. Used by "Photo Intake"
+        // feature for bulk cataloging (e.g., unboxed wholesale shipment).
+        const mode = body.mode || 'product_id';
+        const isMultiScan = mode === 'multi_item_scan';
+
+        const existingNames = Array.isArray(body.existing_sku_names) ? body.existing_sku_names.slice(0, 40) : [];
+        const existingHint = existingNames.length > 0
+          ? `\n\nThe user already has these SKUs in their inventory:\n${existingNames.map(n => `  - ${n}`).join('\n')}\nIf a visible item matches one of these (same or very similar product), set "matches_existing": "<exact name from list>". Otherwise set to null.`
+          : '';
+
+        const prompt = isMultiScan ? `You are cataloging physical inventory from a photo. Identify EVERY distinct consumer product visible in the frame. Products may be toys, household items, electronics, etc. Ignore the floor, packaging, hands, furniture, or background items.
+
+Return ONLY a JSON array (no other text, no markdown). Each element has this shape:
+{
+  "name": "concise product name, e.g. 'Ice Cream Cart Playset'",
+  "brand": "brand name if visible, else null",
+  "category": "one of: toy, food, beverage, household, electronics, beauty, apparel, book, other",
+  "description": "1 short sentence describing the item for a resale listing",
+  "quantity_seen": 1,
+  "suggested_retail_low": 0,
+  "suggested_retail_high": 0,
+  "confidence": "high | medium | low",
+  "matches_existing": null
+}
+
+Rules:
+- If multiple identical items are visible, return ONE entry with quantity_seen=N
+- Distinct variants (e.g., different colors) get separate entries with quantity_seen=1 each
+- Be conservative on confidence — "high" only if you clearly see the product
+- suggested_retail_low/high should reflect typical US resale prices for used/open-box items
+- If the image is too unclear to identify anything, return an empty array []${existingHint}` : `You are identifying a consumer product from a photo. Return ONLY a JSON object with these fields (no other text, no markdown):
 {
   "title": "product name (concise, e.g. 'Dasani Purified Water 20oz Bottle')",
   "brand": "brand name or null if unknown",
@@ -1170,7 +1201,7 @@ If you cannot identify the product at all, return {"title": null, "confidence": 
           },
           body: JSON.stringify({
             model: 'claude-haiku-4-5-20251001',  // fast + cheap for classification
-            max_tokens: 500,
+            max_tokens: isMultiScan ? 2500 : 500,
             messages: [{
               role: 'user',
               content: [
@@ -1195,17 +1226,31 @@ If you cannot identify the product at all, return {"title": null, "confidence": 
             { status: 502, headers: corsHeaders });
         }
 
-        // Parse JSON — strip code fences if model added them
-        const clean = textBlock.text.trim().replace(/^```json\s*|\s*```$/g, '').trim();
+        // Parse JSON — handle preamble text, code fences, both array + object responses
+        let raw = textBlock.text.trim();
+        // Strip markdown code fences if present
+        raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
+        // If there's leading prose, try to extract the first balanced {…} or […] block
+        const arrMatch = raw.match(/\[[\s\S]*\]/);
+        const objMatch = raw.match(/\{[\s\S]*\}/);
+        if (isMultiScan && arrMatch) raw = arrMatch[0];
+        else if (!isMultiScan && objMatch) raw = objMatch[0];
+
         let parsed;
         try {
-          parsed = JSON.parse(clean);
+          parsed = JSON.parse(raw);
         } catch (e) {
-          return new Response(JSON.stringify({ error: 'Invalid JSON from vision', raw: clean }),
+          return new Response(JSON.stringify({ error: 'Invalid JSON from vision', raw: raw.slice(0, 400) }),
             { status: 502, headers: corsHeaders });
         }
 
-        return new Response(JSON.stringify({ ok: true, result: parsed }),
+        // Multi-scan: validate shape is array
+        if (isMultiScan && !Array.isArray(parsed)) {
+          return new Response(JSON.stringify({ error: 'Expected array from multi_item_scan', got: typeof parsed }),
+            { status: 502, headers: corsHeaders });
+        }
+
+        return new Response(JSON.stringify({ ok: true, result: parsed, mode }),
           { status: 200, headers: corsHeaders });
       } catch (e) {
         console.error('Vision endpoint error:', e);
